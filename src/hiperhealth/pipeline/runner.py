@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from hiperhealth.pipeline.context import AuditEntry, PipelineContext
+from hiperhealth.pipeline.models import ExecutionStep, SkillResult
 from hiperhealth.pipeline.session import Inquiry
 from hiperhealth.pipeline.skill import Skill
 
@@ -258,35 +259,87 @@ class StageRunner:
             disabled_skills=disabled_skills,
         )
 
-        for skill in relevant:
-            ctx = skill.pre(stage, ctx)
-            ctx.audit.append(
-                AuditEntry(
-                    stage=stage,
-                    skill_name=skill.metadata.name,
-                    hook='pre',
-                )
-            )
+        run_id = ctx.session_id or 'unknown'
+        if stage not in ctx.skill_results:
+            ctx.skill_results[stage] = {}
 
-        for skill in relevant:
-            ctx = skill.execute(stage, ctx)
-            ctx.audit.append(
-                AuditEntry(
-                    stage=stage,
-                    skill_name=skill.metadata.name,
-                    hook='execute',
+        for hook in ('pre', 'execute', 'post'):
+            for skill in relevant:
+                skill_name = skill.metadata.name
+                ctx.execution_steps.append(
+                    ExecutionStep(
+                        run_id=run_id,
+                        stage=stage,
+                        skill_name=skill_name,
+                        hook=hook,
+                        input_hash='',
+                        status='started',
+                    )
                 )
-            )
 
-        for skill in relevant:
-            ctx = skill.post(stage, ctx)
-            ctx.audit.append(
-                AuditEntry(
-                    stage=stage,
-                    skill_name=skill.metadata.name,
-                    hook='post',
+                try:
+                    func = getattr(skill, hook)
+                    ctx = func(stage, ctx)
+                    status = 'completed'
+                    error_data = None
+                except Exception as e:
+                    status = 'failed'
+                    error_data = {'error': str(e)}
+                    ctx.execution_steps.append(
+                        ExecutionStep(
+                            run_id=run_id,
+                            stage=stage,
+                            skill_name=skill_name,
+                            hook=hook,
+                            input_hash='',
+                            status=status,
+                            error_data=error_data,
+                        )
+                    )
+                    ctx.skill_results[stage][skill_name] = SkillResult(
+                        stage=stage,
+                        skill_name=skill_name,
+                        status='failed',
+                        summary=str(e),
+                    )
+                    raise
+
+                ctx.execution_steps.append(
+                    ExecutionStep(
+                        run_id=run_id,
+                        stage=stage,
+                        skill_name=skill_name,
+                        hook=hook,
+                        input_hash='',
+                        status=status,
+                    )
                 )
-            )
+
+                ctx.audit.append(
+                    AuditEntry(
+                        stage=stage,
+                        skill_name=skill_name,
+                        hook=hook,
+                    )
+                )
+
+                # Implicitly save legacy skill results to avoid overwrites
+                if (
+                    hook == 'execute'
+                    and skill_name not in ctx.skill_results[stage]
+                ):
+                    data = ctx.results.get(stage, {})
+                    if isinstance(data, dict):
+                        data = dict(data)
+                    else:
+                        data = {'legacy_result': data}
+
+                    ctx.skill_results[stage][skill_name] = SkillResult(
+                        stage=stage,
+                        skill_name=skill_name,
+                        status='succeeded',
+                        data=data,
+                    )
 
         return ctx
 
@@ -382,11 +435,15 @@ class StageRunner:
         """
         ctx = session.to_context()
         session.record_event('stage_started', stage=stage)
-        ctx = self.run(
-            stage,
-            ctx,
-            disabled_skills=disabled_skills,
-            **kwargs,
-        )
-        session.update_from_context(stage, ctx)
+        completed = False
+        try:
+            ctx = self.run(
+                stage,
+                ctx,
+                disabled_skills=disabled_skills,
+                **kwargs,
+            )
+            completed = True
+        finally:
+            session.update_from_context(stage, ctx, completed=completed)
         return session
